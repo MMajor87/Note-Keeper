@@ -13,11 +13,14 @@ import base64
 from datetime import datetime
 from pathlib import Path
 
+if sys.platform == "win32":
+    import winreg
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QPushButton, QLabel, QScrollArea,
     QFrame, QButtonGroup, QMessageBox, QFileDialog, QDialog,
-    QDialogButtonBox,
+    QDialogButtonBox, QCheckBox,
 )
 from PyQt6.QtCore import Qt, QEvent, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QPixmap
@@ -27,6 +30,43 @@ IMAGE_DIR = Path.home() / "notes_app_images"
 IMAGE_EXTS = "Images (*.png *.jpg *.jpeg *.gif *.bmp *.webp)"
 IMAGE_MAX_BYTES = 8 * 1024 * 1024
 IMAGE_MAX_PX    = 1600
+
+_STARTUP_REG_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_STARTUP_REG_NAME = "NotesApp"
+
+
+def _startup_app_path() -> str:
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    return f'"{sys.executable}" "{Path(__file__).resolve()}"'
+
+
+def is_startup_enabled() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY, 0, winreg.KEY_READ)
+        winreg.QueryValueEx(key, _STARTUP_REG_NAME)
+        winreg.CloseKey(key)
+        return True
+    except OSError:
+        return False
+
+
+def set_startup_enabled(enabled: bool) -> None:
+    if sys.platform != "win32":
+        return
+    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY, 0, winreg.KEY_WRITE)
+    try:
+        if enabled:
+            winreg.SetValueEx(key, _STARTUP_REG_NAME, 0, winreg.REG_SZ, _startup_app_path())
+        else:
+            try:
+                winreg.DeleteValue(key, _STARTUP_REG_NAME)
+            except FileNotFoundError:
+                pass
+    finally:
+        winreg.CloseKey(key)
 
 # Bright saturated dot colors visible on any dark background
 ACCENT_DOTS = [
@@ -564,12 +604,25 @@ class NotesApp(QMainWindow):
         main.setContentsMargins(28, 28, 28, 28)
         main.setSpacing(0)
 
+        hdr = QHBoxLayout()
+        hdr.setContentsMargins(0, 0, 0, 0)
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
         self.title_lbl = QLabel("Notes")
         self.title_lbl.setObjectName("headTitle")
         self.sub_lbl = QLabel("")
         self.sub_lbl.setObjectName("subtitle")
-        main.addWidget(self.title_lbl)
-        main.addWidget(self.sub_lbl)
+        title_col.addWidget(self.title_lbl)
+        title_col.addWidget(self.sub_lbl)
+        hdr.addLayout(title_col)
+        hdr.addStretch()
+        settings_btn = QPushButton("⚙")
+        settings_btn.setObjectName("iconBtn")
+        settings_btn.setFixedSize(28, 28)
+        settings_btn.setToolTip("Settings")
+        settings_btn.clicked.connect(self._show_settings)
+        hdr.addWidget(settings_btn, 0, Qt.AlignmentFlag.AlignTop)
+        main.addLayout(hdr)
         main.addSpacing(22)
 
         # Input card
@@ -709,6 +762,39 @@ class NotesApp(QMainWindow):
         super().closeEvent(event)
 
     # ------------------------------------------------------------------ actions
+
+    def _show_settings(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Settings")
+        dlg.setMinimumWidth(300)
+        dlg.setStyleSheet(
+            "QDialog { background:#1e1e1c; } "
+            "QCheckBox { color:#c8c3ba; font-size:13px; background:transparent; } "
+            "QCheckBox::indicator { width:16px; height:16px; border:1.5px solid #555; border-radius:4px; background:#252522; } "
+            "QCheckBox::indicator:checked { background:#2a5a8a; border-color:#2a5a8a; } "
+            "QLabel { color:#888; font-size:11px; background:transparent; } "
+            "QPushButton { background:#252522; border:1px solid #3a3835; border-radius:6px; "
+            "padding:5px 18px; color:#c8c3ba; } QPushButton:hover { background:#2e2e2c; }"
+        )
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(12)
+        startup_cb = QCheckBox("Launch with Windows")
+        startup_cb.setChecked(is_startup_enabled())
+        startup_cb.setEnabled(sys.platform == "win32")
+        lay.addWidget(startup_cb)
+        if sys.platform != "win32":
+            note = QLabel("Launch at startup is only available on Windows.")
+            note.setWordWrap(True)
+            lay.addWidget(note)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            try:
+                set_startup_enabled(startup_cb.isChecked())
+            except Exception as e:
+                QMessageBox.warning(self, "Settings error", str(e))
 
     def _set_type(self, t):
         self._type = t
