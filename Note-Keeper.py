@@ -3,7 +3,7 @@
 Notes App -- standalone PyQt6 desktop application.
 Supports text notes, tasks, and attached images.
 Notes are saved to ~/notes_app_data.json automatically.
-Images are stored as base64 inside the JSON file.
+Images are stored as PNG files in ~/notes_app_images/.
 """
 
 import sys
@@ -19,13 +19,14 @@ from PyQt6.QtWidgets import (
     QFrame, QButtonGroup, QMessageBox, QFileDialog, QDialog,
     QDialogButtonBox,
 )
-from PyQt6.QtCore import Qt, QByteArray, QEvent, QTimer, pyqtSignal  # FIX 11: QEvent moved to top-level
-from PyQt6.QtGui import QFont, QPixmap, QImage
+from PyQt6.QtCore import Qt, QEvent, QTimer, pyqtSignal
+from PyQt6.QtGui import QFont, QPixmap
 
 DATA_FILE = Path.home() / "notes_app_data.json"
+IMAGE_DIR = Path.home() / "notes_app_images"
 IMAGE_EXTS = "Images (*.png *.jpg *.jpeg *.gif *.bmp *.webp)"
-IMAGE_MAX_BYTES = 8 * 1024 * 1024   # FIX 5: warn if file exceeds 8 MB
-IMAGE_MAX_PX    = 1600               # FIX 5: scale down images wider/taller than this
+IMAGE_MAX_BYTES = 8 * 1024 * 1024
+IMAGE_MAX_PX    = 1600
 
 # Bright saturated dot colors visible on any dark background
 ACCENT_DOTS = [
@@ -190,10 +191,30 @@ def load_notes():
         try:
             data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
             if isinstance(data, list):
+                if _migrate_b64_images(data):
+                    save_notes(data)
                 return data
         except Exception:
             pass
     return []
+
+
+def _migrate_b64_images(notes) -> bool:
+    """Convert legacy base64 image fields to files. Returns True if anything changed."""
+    changed = False
+    for note in notes:
+        if "image" in note:
+            try:
+                IMAGE_DIR.mkdir(exist_ok=True)
+                raw = base64.b64decode(note["image"])
+                filename = f"{note['id']}.png"
+                (IMAGE_DIR / filename).write_bytes(raw)
+                note["image_file"] = filename
+            except Exception:
+                pass
+            del note["image"]
+            changed = True
+    return changed
 
 
 def save_notes(notes, parent_widget=None):
@@ -211,11 +232,8 @@ def save_notes(notes, parent_widget=None):
         )
 
 
-def image_to_b64(path: str) -> str:
-    """
-    FIX 5: Check file size before loading; scale down oversized images.
-    Returns a base64-encoded JPEG/PNG string suitable for storage.
-    """
+def _load_and_validate_image(path: str) -> QPixmap:
+    """Validate size/format and return a (possibly scaled) QPixmap."""
     p = Path(path)
     if p.stat().st_size > IMAGE_MAX_BYTES:
         raise ValueError(
@@ -225,28 +243,41 @@ def image_to_b64(path: str) -> str:
     px = QPixmap(path)
     if px.isNull():
         raise ValueError("File could not be read as an image.")
-    # Scale down if too large
     if px.width() > IMAGE_MAX_PX or px.height() > IMAGE_MAX_PX:
         px = px.scaled(
             IMAGE_MAX_PX, IMAGE_MAX_PX,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-    buf = QByteArray()
-    from PyQt6.QtCore import QBuffer
-    qbuf = QBuffer(buf)
-    qbuf.open(QBuffer.OpenModeFlag.WriteOnly)
-    px.save(qbuf, "PNG")
-    return base64.b64encode(bytes(buf)).decode()
+    return px
 
 
-def b64_to_pixmap(b64: str) -> QPixmap:
-    # FIX 3: check for null image after decode
-    data = QByteArray(base64.b64decode(b64))
-    img = QImage.fromData(data)
-    if img.isNull():
-        raise ValueError("Stored image data is corrupt or unrecognisable.")
-    return QPixmap.fromImage(img)
+def save_image_file(path: str, note_id: str) -> str:
+    """Copy and (if needed) scale an image into IMAGE_DIR. Returns the filename."""
+    IMAGE_DIR.mkdir(exist_ok=True)
+    px = _load_and_validate_image(path)
+    filename = f"{note_id}.png"
+    dest = IMAGE_DIR / filename
+    if not px.save(str(dest)):
+        raise ValueError(f"Could not write image to {dest}")
+    return filename
+
+
+def load_image_pixmap(filename: str) -> QPixmap:
+    """Load a QPixmap from IMAGE_DIR by filename."""
+    path = IMAGE_DIR / filename
+    px = QPixmap(str(path))
+    if px.isNull():
+        raise ValueError(f"Image file missing or corrupt: {path}")
+    return px
+
+
+def _delete_image_file(filename):
+    if filename:
+        try:
+            (IMAGE_DIR / filename).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -373,9 +404,9 @@ class NoteCard(QFrame):
         text_col.addWidget(lbl)
 
         # Image thumbnail
-        if note.get("image"):
+        if note.get("image_file"):
             try:
-                px = b64_to_pixmap(note["image"])  # FIX 3: raises on null
+                px = load_image_pixmap(note["image_file"])
                 thumb = px.scaledToWidth(
                     min(340, px.width()), Qt.TransformationMode.SmoothTransformation
                 )
@@ -440,7 +471,7 @@ class NoteCard(QFrame):
             tb.clicked.connect(self._toggle)
             meta.addWidget(tb)
 
-        if note.get("image") and not note_done:
+        if note.get("image_file") and not note_done:
             rmimg = QPushButton("⊗")
             rmimg.setObjectName("iconBtn")
             rmimg.setFixedSize(26, 22)
@@ -503,10 +534,10 @@ class NotesApp(QMainWindow):
         self.setMinimumSize(560, 600)
         self.resize(640, 740)
         self.notes = load_notes()
-        self._filter        = "all"
-        self._type          = "note"
-        self._color         = 0
-        self._pending_image = None
+        self._filter             = "all"
+        self._type               = "note"
+        self._color              = 0
+        self._pending_image_path = None
 
         # FIX 6: debounce saves so rapid actions don't block the UI
         self._save_timer = QTimer(self)
@@ -708,8 +739,8 @@ class NotesApp(QMainWindow):
         self.img_btn.style().polish(self.img_btn)
 
     def _attach_image(self):
-        if self._pending_image:
-            self._pending_image = None
+        if self._pending_image_path:
+            self._pending_image_path = None
             self.img_preview.hide()
             self._set_img_btn(False)
             return
@@ -720,12 +751,10 @@ class NotesApp(QMainWindow):
         if not path:
             return
         try:
-            b64 = image_to_b64(path)
-            self._pending_image = b64
-            px = b64_to_pixmap(b64).scaledToHeight(
-                56, Qt.TransformationMode.SmoothTransformation
-            )
-            self.img_preview.setPixmap(px)
+            px = _load_and_validate_image(path)
+            self._pending_image_path = path
+            thumb = px.scaledToHeight(56, Qt.TransformationMode.SmoothTransformation)
+            self.img_preview.setPixmap(thumb)
             self.img_preview.show()
             self._set_img_btn(True)
         except Exception as e:
@@ -733,25 +762,29 @@ class NotesApp(QMainWindow):
 
     def _add_note(self):
         text = self.input_box.toPlainText().strip()
-        if not text and not self._pending_image:
+        if not text and not self._pending_image_path:
             return
         if not text:
             text = "(image)"
         color_name = ACCENT_DOTS[self._color][1]
+        note_id = str(uuid.uuid4())
         note = {
-            "id": str(uuid.uuid4()),
+            "id": note_id,
             "text": text,
             "type": self._type,
             "color": color_name,
             "done": False,
             "createdAt": datetime.now().isoformat(),
         }
-        if self._pending_image:
-            note["image"] = self._pending_image
+        if self._pending_image_path:
+            try:
+                note["image_file"] = save_image_file(self._pending_image_path, note_id)
+            except Exception as e:
+                QMessageBox.warning(self, "Image error", str(e))
         self.notes.insert(0, note)
         self._schedule_save()
         self.input_box.clear()
-        self._pending_image = None
+        self._pending_image_path = None
         self.img_preview.hide()
         self._set_img_btn(False)
         self._refresh()
@@ -765,6 +798,10 @@ class NotesApp(QMainWindow):
         self._refresh()
 
     def _delete_note(self, nid):
+        for n in self.notes:
+            if n["id"] == nid:
+                _delete_image_file(n.get("image_file"))
+                break
         self.notes = [n for n in self.notes if n["id"] != nid]
         self._schedule_save()
         self._refresh()
@@ -780,7 +817,8 @@ class NotesApp(QMainWindow):
     def _remove_image(self, nid):
         for n in self.notes:
             if n["id"] == nid:
-                n.pop("image", None)
+                _delete_image_file(n.get("image_file"))
+                n.pop("image_file", None)
                 break
         self._schedule_save()
         self._refresh()
@@ -795,6 +833,9 @@ class NotesApp(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
         )
         if r == QMessageBox.StandardButton.Yes:
+            for n in self.notes:
+                if n.get("done"):
+                    _delete_image_file(n.get("image_file"))
             self.notes = [n for n in self.notes if not n.get("done")]
             self._schedule_save()
             self._refresh()
